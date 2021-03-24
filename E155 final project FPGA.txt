@@ -1,0 +1,661 @@
+module finalproject(input logic clk,
+                    input logic piReady,
+                    input logic sdi,
+                    input logic micMISO,
+                    input logic piclk,
+                    output logic piSpiEn,
+                    output logic sdo,
+                    output logic micMOSI,
+                    output logic micCS,
+                    output logic sclk,
+                    output logic [7:0] leds);
+        //signals for the controller
+        logic micSpiDone, fftDone, getData, giveData, fftStart, micSpiEn, fftDoneHold;
+        logic [4:0] adrData;
+        
+        //signals for spiMic
+        logic [15:0] micData;
+        
+        //signals for spiPi, fft
+        logic [31:0] fftOut;
+        
+        //debugging
+        logic [3:0] stateNumber;
+        logic [1:0] spiStateNumber;
+        
+        slowclk final_slowclk(clk, sclk);
+        controller final_controller(sclk, micSpiDone, fftDone, piReady, getData, giveData, fftStart, micSpiEn, piSpiEn, fftDoneHold, adrData, stateNumber);
+
+        spiMic final_spiMic(micSpiEn, sclk, micMISO, micMOSI, micCS, micData, micSpiDone, spiStateNumber);
+        spiPi final_spiPi(piclk, fftOut, sdo);minifft final_fft(sclk, fftStart, getData, giveData, adrData, micData, fftDone, fftOut);
+        
+        logic fftWasDone, piSpiEnWas, micSpiDoneWas;
+        always_ff @(posedge clk)
+            begin
+                if(fftDone) fftWasDone <= fftDone;
+                else fftWasDone <= fftWasDone;
+                
+                if(piSpiEn) piSpiEnWas <= piSpiEn;
+                else piSpiEnWas <= piSpiEnWas;
+                
+                if(micSpiDone) micSpiDoneWas <= micSpiDone;
+                else micSpiDoneWas <= micSpiDoneWas;
+            end
+            
+         //debugging leds
+        assign leds[1:0] = spiStateNumber;
+        assign leds[2] = piReady;
+        assign leds[3] = piSpiEn;
+        assign leds[7:4] = stateNumber;        
+endmodule
+
+//Make a slow clock to access from other modules
+module slowclk(input logic clk,
+        output logic sclk);
+    
+    logic [31:0] sclkCount = 32'b0;
+    logic [31:0] sclkDelay = 32'd1000; //clock divider sets sampling rate                
+    
+    always_ff @(posedge clk)
+        if (sclkCount > sclkDelay)
+            begin
+                sclk <= ~sclk;
+                sclkCount <= 0;
+            end
+        else sclkCount <= sclkCount + 1;
+endmodule
+
+//master controller for all FPGA logic
+module controller(input logic clk,
+                        input logic micSpiDone,
+                        input logic fftDone,
+                        input logic piReady,
+                        output logic getData,
+                        output logic giveData,
+                        output logic fftStart,
+                        output logic micSpiEn,
+                        output logic piSpiEn,
+                        output logic fftDoneHold,
+                        output logic [4:0] adrData,
+                        output logic [3:0] stateNumber);
+    logic nextGetData, nextGiveData, nextFftStart, nextMicSpiEn, nextPiSpiEn, nextFftDoneHold;
+    logic [4:0] nextAdrData;
+    logic [3:0] nextStateNumber;
+    
+    typedef enum logic [3:0] {S0, S1, S2, S3, S4, S5, S6, S7, S8, S9} statetype;
+    statetype state, nextstate;
+    
+    always_ff @(posedge clk)
+        begin
+            state <= nextstate;
+            getData <= nextGetData;
+            giveData <= nextGiveData;
+            fftStart <= nextFftStart;
+            micSpiEn <= nextMicSpiEn;
+            piSpiEn <= nextPiSpiEn;
+            fftDoneHold <= nextFftDoneHold;
+            adrData <= nextAdrData;
+            stateNumber <= nextStateNumber;
+        end
+        
+    always_comb
+        begin
+            nextAdrData = 0;
+            nextstate = S0;
+            case(state)
+                S0: //initialize mic SPI
+                    begin
+                        nextstate = S1;
+                        nextGetData = 0;
+                        nextGiveData = 0;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 1;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = 0;
+                        nextAdrData = adrData;
+                        nextStateNumber = 4'b0000;
+                    end
+                S1: //wait for spi value to fill
+                    begin
+                        if(micSpiDone) nextstate = S2;
+                        else nextstate = S1;
+                        nextGetData = 0;
+                        nextGiveData = 0;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 1;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = 0;
+                        nextAdrData = adrData;
+                        nextStateNumber = 4'b0001;
+                    end
+                S2: //put spi value in memory and loop or finish
+                    begin
+                        if(adrData<31) nextstate = S0;
+                        else nextstate = S3;
+                        nextGetData = 1;
+                        nextGiveData = 0;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = 0;
+                        nextAdrData = adrData+5'b00001;
+                        nextStateNumber = 4'b0010;
+                    end
+                S3: //initialize fft
+                    begin
+                        nextstate = S4;
+                        nextGetData = 0;
+                        nextGiveData = 0;
+                        nextFftStart = 1;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = 0;
+                        nextAdrData = 0;
+                        nextStateNumber = 4'b0011;
+                    end
+                S4: //hold fftstart for one more clock cycle
+                    begin
+                        nextstate = S5;
+                        nextGetData = 0;
+                        nextGiveData = 0;
+                        nextFftStart = 1;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = 0;
+                        nextAdrData = 0;
+                        nextStateNumber = 4'b0100;
+                    end
+                S5: //wait for fft to be done
+                    begin
+                        if(fftDone) nextstate = S6;
+                        else nextstate = S5;
+                        nextGetData = 0;
+                        nextGiveData = 0;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = 0;
+                        nextAdrData = 0;
+                        nextStateNumber = 4'b0101;
+                    end
+                S6: //configure memory to give data, check to 
+					//make sure pi is ready
+                    begin
+                        if(piReady) nextstate = S7;
+                        else nextstate = S0;
+                        nextGetData = 0;
+                        nextGiveData = 1;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = 1;
+                        nextAdrData = 0;
+                        nextStateNumber = 4'b0110;
+                    end
+                S7: //enable spi, wait for pi to get data
+                    begin
+                        if(piReady) nextstate = S7;
+                        else nextstate = S8;
+                        nextGetData = 0;
+                        nextGiveData = giveData;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 1;
+                        nextFftDoneHold = fftDoneHold;
+                        nextAdrData = adrData;
+                        nextStateNumber = 4'b0111;
+                    end
+                S8: //increment address counter
+                    begin
+                        if(adrData<31) nextstate = S9;
+                        else nextstate = S0;
+                        nextGetData = 0;
+                        nextGiveData = giveData;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = fftDoneHold;
+                        nextAdrData = adrData+5'b00001;
+                        nextStateNumber = 4'b1000;
+                    end
+                S9: //wait for pi to be ready again
+                    begin
+                        if(piReady) nextstate = S7;
+                        else nextstate = S9;
+                        nextGetData = 0;
+                        nextGiveData = giveData;
+                        nextFftStart = 0;
+                        nextMicSpiEn = 0;
+                        nextPiSpiEn = 0;
+                        nextFftDoneHold = fftDoneHold;
+                        nextAdrData = adrData;
+                        nextStateNumber = 4'b1001;
+                    end
+            endcase
+        end
+endmodule
+
+//Enables SPI communication between the ADC and FPGA
+module spiMic(input logic micSpiEn,
+                    input logic clk,
+                    input micMISO, 
+                    output logic micMOSI,
+                    output logic micCS,
+                    output logic [15:0] micData,
+                    output logic micSpiDone,
+                    output logic [1:0] spiStateNumber);
+                    
+    
+    //instantiate variables for timing and decoder logic
+    logic [31:0] count = 32'b0;
+    logic [31:0] nextCount = 32'b0;
+    logic [15:0] startSequence = 16'b1101000000000000;
+    logic [15:0] amask = 16'b0000001111111111;
+    
+    logic [15:0] amp, nextAmp;
+    
+    logic [1:0] nextSpiStateNumber;
+        
+    //state definitions
+    typedef enum logic [1:0] {S0, S1, S2} statetype;
+    
+    statetype state, nextstate;
+    
+    //state advancing logic
+    always_ff @(negedge clk)
+        begin
+            state <= nextstate;
+            amp <= nextAmp;
+            count <= nextCount;
+            if(micSpiDone) micData <= (amp&amask);//-16'd512;
+            else micData <= micData;
+            spiStateNumber <= nextSpiStateNumber;
+        end
+        
+    //combinational logic for states
+    always_comb
+        begin
+            nextstate = S0;
+            case(state)
+                S0: //starter state, wait for enable
+                    begin
+                        nextSpiStateNumber = 2'b00;
+                        micCS = 1;
+                        micSpiDone = 0;
+                        micMOSI = 1'b0;
+                        nextAmp = amp;
+                        nextCount = 0;
+                        if(micSpiEn) nextstate = S1;
+                        else nextstate = S0;
+                    end
+                S1: //send start sequence
+                    begin 
+                        nextSpiStateNumber = 2'b01;
+                        micCS = 0;
+                        micSpiDone = 0;
+                        micMOSI = startSequence[15-count];
+                        nextAmp = amp;
+                        nextAmp[15-count] = micMISO;
+                        nextCount = count + 1;
+                        if (count>32'd14) nextstate = S2;
+                        else nextstate = S1;
+                    end
+                S2: //finished state, assert done
+                    begin
+                        nextSpiStateNumber = 2'b11;
+                        micCS = 1;
+                        micSpiDone = 1;
+                        micMOSI = 1'b0;
+                        nextAmp = amp;
+                        nextCount = 0;
+                        nextstate = S0;
+                    end
+            endcase
+        end
+endmodule
+
+//simply shifts out data on clock edges - GPIO pins piReady and piSpiEn handle when this occurs
+module spiPi(input logic clk,
+                    input logic [31:0] fftOut,
+                    output logic sdo);
+    
+    logic [4:0] count = 5'b0;
+    
+    always_ff @(posedge clk)
+        begin
+            sdo <= fftOut[count];
+            if(count == 5'd31) count <= 5'b0; 
+            else count <= count + 5'b00001;
+        end
+endmodule
+
+module minifft(input logic clk,
+                input logic fftStart,
+                input logic getData,
+                input logic giveData,
+                input logic [4:0] adrData,
+                input logic [15:0] micData,
+                output logic fftDone,
+                output logic [31:0] fftOut);
+                
+    //inputs/outputs for the controller
+    logic [4:0] adrA, adrB;
+    logic memwr, sclk;
+    logic [3:0] twiddleAdr;
+    
+    //inputs/outputs for twiddleROM
+    logic [15:0] twiddleFactor1, twiddleFactor2;
+    
+    //inputs/outputs for BFU
+    logic [15:0] BFUdataAreal, BFUdataBreal, BFUdataAimag, BFUdataBimag;
+    logic [15:0] memDataAreal, memDataBreal, memDataAimag, memDataBimag;
+    
+    minicontroller minifft_controller(clk, fftStart, fftDone, adrA, adrB, memwr, twiddleAdr);
+    
+    minitwiddleROM minifft_twiddleROM(clk, twiddleAdr, twiddleFactor1, twiddleFactor2);
+    
+    minibutterfly minifft_butterfly(clk, twiddleFactor1, twiddleFactor2, 
+    BFUdataAreal,BFUdataBreal, BFUdataAimag, BFUdataBimag, memDataAreal, memDataBreal, memDataAimag, memDataBimag);
+    
+    minimem minifft_mem(clk, memwr, getData, giveData, micData, adrData, adrA, adrB, memDataAreal, memDataBreal, memDataAimag, memDataBimag,
+    BFUdataAreal, BFUdataBreal, BFUdataAimag, BFUdataBimag, fftOut);
+endmodule
+                
+ //need to generate control signals for the fft
+module minicontroller(input logic clk,
+                        input logic fftStart,
+                        output logic fftDone,
+                        output logic [4:0] adrA,
+                        output logic [4:0] adrB,
+                        output logic memwr,
+                        output logic [3:0] twiddleAdr);
+
+    logic [31:0] ja, jb, nextja, nextjb;
+    logic [31:0] twiddle, nextTwiddle;
+    logic nextmemwr, nextfftDone;
+    logic [31:0] jcount, icount, nextjcount, nexticount;
+    logic [31:0] N = 16'd16; //for 10 bit address: N = 16'd512
+    logic [31:0] levels = 16'd5; //for 10 bit address: levels = 16'd10
+    
+    assign adrA = ja[4:0];
+    assign adrB = jb[4:0];
+    assign twiddleAdr = twiddle[3:0];
+                        
+    typedef enum logic [2:0] {S0, S1, S2, S3, S4} statetype;
+    statetype state, nextstate;
+    
+    //state advancing logic
+    always_ff @(posedge clk)
+        begin
+            state <= nextstate;
+            ja <= nextja;
+            jb <= nextjb;
+            twiddle <= nextTwiddle;
+            jcount <= nextjcount;
+            icount <= nexticount;
+            memwr <= nextmemwr;
+            fftDone <= nextfftDone;
+        end
+        
+    always_comb
+        begin
+            nextstate = S0;
+            case(state)
+                S0: //wait for fftStart signal
+                    begin
+                        if(fftStart) nextstate = S1;
+                        else nextstate = S0;
+                        nextja = 32'b0;
+                        nextjb = 32'b0;
+                        nextTwiddle = 32'b0;
+                        nexticount = 32'b0;
+                        nextjcount = 32'b0;
+                        nextmemwr = 1'b0;
+                        nextfftDone = 1'b0;
+                    end
+                S1: //j-incrementing for loop to generate addresses
+                    begin
+                        nextstate = S2;
+                        nextja = jcount<<1;
+                        nextjb = nextja+1;
+                        nextja = ((nextja<<icount)|(nextja>>(levels-icount)))&32'h1f; //10 bit mask: 3ff
+                        nextjb = ((nextjb<<icount)|(nextjb>>(levels-icount)))&32'h1f; //10 bit mask: 3ff
+                        nextTwiddle = ((32'hfffffff0>>icount)&32'hf)&jcount;
+                        nexticount = icount;
+                        nextjcount = jcount+32'b1;
+                        nextmemwr = 1'b0;
+                        nextfftDone = 1'b0;
+                    end
+                S2: //write to mem from newly generated addresses
+                    begin
+                        if(jcount <(N)) nextstate = S1;
+                        else nextstate = S3;
+                        nextja = ja;
+                        nextjb = jb;
+                        nextTwiddle = twiddle;
+                        nexticount = icount;
+                        nextjcount = jcount;
+                        nextmemwr = 1'b1;
+                        nextfftDone = 1'b0;
+                    end
+                S3: //i incrementing for loop
+                    begin
+                        if (icount<(levels-1)) nextstate = S1;
+                        else nextstate = S4;
+                        nextja = ja;
+                        nextjb = jb;
+                        nextTwiddle = twiddle;
+                        nexticount = icount+32'b1;
+                        nextjcount = 0;
+                        nextmemwr = 1'b0;
+                        nextfftDone = 1'b0;
+                    end
+                S4: //finished state to assert fftDone
+                    begin
+                        nextstate = S0;
+                        nextja = 32'b0;
+                        nextjb = 32'b0;
+                        nextTwiddle = 32'b0;
+                        nexticount = 32'b0;
+                        nextjcount = 32'b0;
+                        nextmemwr = 1'b0;
+                        nextfftDone = 1'b1;
+                    end
+            endcase
+        end
+endmodule
+
+//lookup table for twiddle addresses
+module minitwiddleROM(input logic clk,
+                        input logic [3:0] twiddleAdr,
+                        output logic [15:0] twiddleFactor1,
+                        output logic [15:0] twiddleFactor2);
+    always_comb
+        case(twiddleAdr)
+            4'b0000:
+                begin
+                    twiddleFactor1 = 16'h7fff;
+                    twiddleFactor2 = 16'h0000;
+                end
+            4'b0001:
+                begin
+                    twiddleFactor1 = 16'h7d89;
+                    twiddleFactor2 = 16'h18f9;
+                end
+            4'b0010:
+                begin
+                    twiddleFactor1 = 16'h7641;
+                    twiddleFactor2 = 16'h30fb;
+                end
+            4'b0011:
+                begin
+                    twiddleFactor1 = 16'h6a6d;
+                    twiddleFactor2 = 16'h471c;
+                end
+            4'b0100:
+                begin
+                    twiddleFactor1 = 16'h5a82;
+                    twiddleFactor2 = 16'h5a82;
+                end
+            4'b0101:
+                begin
+                    twiddleFactor1 = 16'h471c;
+                    twiddleFactor2 = 16'h6a6d;
+                end
+            4'b0110:
+                begin
+                    twiddleFactor1 = 16'h30fb;
+                    twiddleFactor2 = 16'h7641;
+                end
+            4'b0111:
+                begin
+                    twiddleFactor1 = 16'h18f9;
+                    twiddleFactor2 = 16'h7d89;
+                end
+            4'b1000:
+                begin
+                    twiddleFactor1 = 16'h0000;
+                    twiddleFactor2 = 16'h7fff;
+                end
+            4'b1001:
+                begin
+                    twiddleFactor1 = 16'he707;
+                    twiddleFactor2 = 16'h7d89;
+                end
+            4'b1010:
+                begin
+                    twiddleFactor1 = 16'hcf05;
+                    twiddleFactor2 = 16'h7641;
+                end
+            4'b1011:
+                begin
+                    twiddleFactor1 = 16'hb8e4;
+                    twiddleFactor2 = 16'h6a6d;
+                end
+            4'b1100:
+                begin
+                    twiddleFactor1 = 16'ha57e;
+                    twiddleFactor2 = 16'h5a82;
+                end
+            4'b1101:
+                begin
+                    twiddleFactor1 = 16'h9593;
+                    twiddleFactor2 = 16'h471c;
+                end
+            4'b1110:
+                begin
+                    twiddleFactor1 = 16'h89bf;
+                    twiddleFactor2 = 16'h30fb;
+                end
+            4'b1111:
+                begin
+                    twiddleFactor1 = 16'h8277;
+                    twiddleFactor2 = 16'h18f9;
+                end
+        endcase    
+endmodule
+
+//does all of the butterfly operation
+module minibutterfly(input logic clk,
+                        input logic [15:0] twiddleFactor1,
+                        input logic [15:0] twiddleFactor2,
+                        input logic [15:0] BFUdataAreal,
+                        input logic [15:0] BFUdataBreal,
+                        input logic [15:0] BFUdataAimag,
+                        input logic [15:0] BFUdataBimag,
+                        output logic [15:0] memDataAreal,
+                        output logic [15:0] memDataBreal,
+                        output logic [15:0] memDataAimag,
+                        output logic [15:0] memDataBimag);
+    logic [31:0] BrealPostMult, BimagPostMult;
+
+    complexMult bfu_cmult(twiddleFactor1, twiddleFactor2, BFUdataBreal, 
+                                    BFUdataBimag, BrealPostMult, BimagPostMult);
+    
+    assign memDataAreal = (BFUdataAreal + BrealPostMult[30:15]); //bitshift by 15 for twiddle floating point
+    assign memDataAimag = (BFUdataAimag + BimagPostMult[30:15]);
+    assign memDataBreal = (BFUdataAreal - BrealPostMult[30:15]);
+    assign memDataBimag = (BFUdataAimag - BimagPostMult[30:15]);                    
+endmodule
+
+
+//multiplying two complex numbers
+module complexMult(input logic [15:0] twiddleFactor1,
+                        input logic [15:0] twiddleFactor2,
+                        input logic [15:0] BFUdataBreal,
+                        input logic [15:0] BFUdataBimag,
+                        output logic [31:0] BrealPostMult,
+                        output logic [31:0] BimagPostMult);
+    logic signed [15:0] stwiddleFactor1, stwiddleFactor2; //MUST DO SIGNED MULTIPLICATION!!
+    logic signed [15:0] sBFUdataBreal, sBFUdataBimag;
+    logic signed [31:0] sBrealPostMult, sBimagPostMult;
+    assign stwiddleFactor1 = twiddleFactor1;
+    assign stwiddleFactor2 = twiddleFactor2;
+    assign sBFUdataBreal = BFUdataBreal;
+    assign sBFUdataBimag = BFUdataBimag;
+    assign sBrealPostMult = sBFUdataBreal*stwiddleFactor1 - sBFUdataBimag*stwiddleFactor2; //real part
+    assign sBimagPostMult = sBFUdataBreal*stwiddleFactor2 + sBFUdataBimag*stwiddleFactor1; //imaginary part
+    assign BrealPostMult = sBrealPostMult;
+    assign BimagPostMult = sBimagPostMult;
+endmodule
+
+//double-addressed memory block
+module minimem(input logic clk,
+                input logic memwr,
+                input logic getData,
+                input logic giveData,
+                input logic [15:0] micData,
+                input logic [4:0] adrData,
+                input logic [4:0] adrA,
+                input logic [4:0] adrB,
+                input logic [15:0] memDataAreal,
+                input logic [15:0] memDataBreal,
+                input logic [15:0] memDataAimag,
+                input logic [15:0] memDataBimag,
+                output logic [15:0] BFUdataAreal,
+                output logic [15:0] BFUdataBreal,
+                output logic [15:0] BFUdataAimag,
+                output logic [15:0] BFUdataBimag,
+                output logic [31:0] fftOut);
+    logic [31:0] mem[31:0]; //bits 0-15 are real, 16-31 are imaginary
+    logic [4:0] adrDatarev;
+    assign adrDatarev = {adrData[0], adrData[1], adrData[2], adrData[3], adrData[4]};
+    always @(posedge clk)
+        begin
+            if(getData) //loading values into memory
+                begin
+                    mem[adrDatarev][15:0] <= micData;
+                    mem[adrDatarev][31:16] <= 16'b0;
+                    fftOut <= 31'b0;
+                    BFUdataAreal <= 16'b0;
+                    BFUdataAimag <= 16'b0;
+                    BFUdataBreal <= 16'b0;
+                    BFUdataBimag <= 16'b0;
+                end
+            else if(giveData) //loading values out of memory
+                begin
+                    fftOut <= mem[adrData];
+                    BFUdataAreal <= 16'b0;
+                    BFUdataAimag <= 16'b0;
+                    BFUdataBreal <= 16'b0;
+                    BFUdataBimag <= 16'b0;
+                end
+            else //using memory for fft
+                begin
+                    fftOut <= 31'b0;
+                    BFUdataAreal <= mem[adrA][15:0];
+                    BFUdataAimag <= mem[adrA][31:16];
+                    BFUdataBreal <= mem[adrB][15:0];
+                    BFUdataBimag <= mem[adrB][31:16];
+                    if(memwr)
+                        begin
+                            mem[adrA][15:0] <= memDataAreal;
+                            mem[adrA][31:16] <= memDataAimag;
+                            
+                            mem[adrB][15:0] <= memDataBreal;
+                            mem[adrB][31:16] <= memDataBimag;
+                        end
+                end
+        end
+endmodule
+
